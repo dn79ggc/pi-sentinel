@@ -1,0 +1,6 @@
+opencv-python-headless
+numpy
+langchain-core
+langchain-google-genai
+requests
+python-dotenv
