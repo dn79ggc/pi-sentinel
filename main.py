@@ -1,113 +1,113 @@
 import argparse
 import logging
 import os
-import sys
+import signal
+import threading
 import time
-from datetime import datetime
-
-import cv2
+from pathlib import Path
 
 import config
+from buffer import FrameBuffer
+from capture import Capture, open_camera
+from clip import encode_jpeg, ffmpeg_available
+from events import EventTracker
 from llm import describe
 from motion import MotionDetector
-from notifier import post
-from throttle import Throttle
+from notifier import edit_message, post_message
+from outbox import Outbox
+from pipeline import EventSink, process
+from reporter import Reporter
+from scheduler import Dispatcher, Pacer
 
 log = logging.getLogger("sentinel")
 
-MAX_READ_FAILURES = 30
 REQUIRED_ENV = ("GOOGLE_API_KEY", "GEMINI_MODEL", "DISCORD_WEBHOOK_URL")
 
 
-def encode_jpeg(frame):
-    height, width = frame.shape[:2]
-    if width > config.SEND_WIDTH:
-        scale = config.SEND_WIDTH / width
-        frame = cv2.resize(frame, (config.SEND_WIDTH, int(height * scale)))
-    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY])
-    if not ok:
-        raise RuntimeError("JPEG encoding failed")
-    return buffer.tobytes()
-
-
-def save_frame(jpeg):
-    config.FRAME_DIR.mkdir(parents=True, exist_ok=True)
-    path = config.FRAME_DIR / f"{datetime.now():%Y%m%d-%H%M%S-%f}.jpg"
-    path.write_bytes(jpeg)
-    return path
-
-
-def report(jpeg):
-    try:
-        text = describe(jpeg, config.GEMINI_MODEL)
-    except Exception as exc:
-        log.exception("Gemini call failed")
-        text = f"Motion detected. The Gemini call failed ({type(exc).__name__})."
-    try:
-        post(config.DISCORD_WEBHOOK_URL, text, jpeg)
-    except Exception:
-        log.exception("Discord post failed")
-
-
-def on_motion(frame):
-    jpeg = encode_jpeg(frame)
-    path = save_frame(jpeg) if config.SAVE_FRAMES else None
-    log.info("Motion event (saved to %s)", path)
-    report(jpeg)
-
-
-def process(frames, detector, throttle, on_event):
-    for frame in frames:
-        # The detector must see every frame, so it runs before the throttle.
-        if detector.update(frame) and throttle.allow():
-            on_event(frame)
-
-
-def read_frames(cap):
-    failures = 0
-    while True:
-        ok, frame = cap.read()
-        if ok:
-            failures = 0
-            yield frame
-            continue
-        failures += 1
-        if failures >= MAX_READ_FAILURES:
-            raise SystemExit("Camera stopped returning frames.")
-        time.sleep(0.1)
-
-
-def open_camera():
-    backend = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
-    cap = cv2.VideoCapture(config.CAMERA_INDEX, backend)
-    if not cap.isOpened():
-        raise SystemExit(
-            f"Could not open camera index {config.CAMERA_INDEX}. "
-            "On Linux, list devices with: v4l2-ctl --list-devices"
-        )
-    # MJPG is needed for usable frame rates at 720p on most USB webcams.
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAPTURE_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAPTURE_HEIGHT)
-    return cap
+def build_dispatchers(outbox, reporter):
+    pacers = {
+        "discord": Pacer(outbox, "discord", config.ALERT_MIN_GAP_SECONDS),
+        "gemini": Pacer(outbox, "gemini", config.GEMINI_COOLDOWN_SECONDS),
+    }
+    common = dict(
+        handlers=reporter.handlers(),
+        pacers=pacers,
+        max_retries=config.MAX_RETRIES,
+        backoff=config.RETRY_BACKOFF_SECONDS,
+        on_give_up={"analyze": reporter.analysis_failed},
+    )
+    # Separate threads, so a slow Gemini call never delays an alert.
+    discord = Dispatcher(outbox, ["discord"], **common)
+    gemini = Dispatcher(
+        outbox,
+        ["gemini"],
+        policy=config.THROTTLE_POLICY,
+        on_drop={"analyze": reporter.analysis_dropped},
+        **common,
+    )
+    return discord, gemini
 
 
 def run_camera():
-    cap = open_camera()
+    if not ffmpeg_available():
+        log.warning("ffmpeg was not found, so events will send key frames instead of clips. Install: sudo apt install ffmpeg")
+
+    outbox = Outbox(config.DB_PATH)
+    reporter = Reporter(outbox, config, describe, post_message, edit_message)
+    interrupted = outbox.recover(time.time())
+    if interrupted:
+        log.warning("Events cut short by the last shutdown: %s", interrupted)
+
+    buffer = FrameBuffer(config.PRE_ROLL_SECONDS + config.MAX_EVENT_SECONDS + config.POST_ROLL_SECONDS + 10)
+    tracker = EventTracker(config.POST_ROLL_SECONDS, config.MAX_EVENT_SECONDS)
     detector = MotionDetector(min_fraction=config.MOTION_MIN_FRACTION)
-    throttle = Throttle(config.COOLDOWN_SECONDS, config.DAILY_CALL_CAP)
+    sink = EventSink(outbox, buffer, reporter, config)
+
+    def consume(frames):
+        process(
+            frames,
+            detector,
+            tracker,
+            buffer,
+            sink,
+            buffer_interval=1 / config.BUFFER_FPS,
+            encode=lambda frame: encode_jpeg(frame, config.BUFFER_WIDTH, config.BUFFER_JPEG_QUALITY),
+        )
+
+    stop = threading.Event()
+    for name in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(name, lambda *_: stop.set())
+
+    capture = Capture(open_camera(), consume)
+    workers = [
+        threading.Thread(target=dispatcher.run, args=(stop,), name=label, daemon=True)
+        for dispatcher, label in zip(build_dispatchers(outbox, reporter), ("discord", "gemini"))
+    ]
+    for worker in workers:
+        worker.start()
+    capture.start()
     log.info("Watching camera %d. Press Ctrl+C to stop.", config.CAMERA_INDEX)
-    try:
-        process(read_frames(cap), detector, throttle, on_motion)
-    except KeyboardInterrupt:
-        log.info("Stopped.")
-    finally:
-        cap.release()
+
+    while not stop.is_set() and capture.is_alive():
+        stop.wait(1)
+
+    capture.stop()
+    capture.join(timeout=10)
+    sink.shutdown()
+    stop.set()
+    for worker in workers:
+        worker.join(timeout=10)
+    outbox.close()
+    log.info("Stopped.")
+    if capture.error:
+        raise SystemExit(str(capture.error))
 
 
 def run_test_image(path):
-    with open(path, "rb") as handle:
-        report(handle.read())
+    jpeg = Path(path).read_bytes()
+    text = describe([jpeg], config.GEMINI_MODEL, reason="a test image")
+    post_message(config.DISCORD_WEBHOOK_URL, text, [("test.jpg", jpeg, "image/jpeg")])
+    log.info("Posted the test image.")
 
 
 def main():
